@@ -31,6 +31,7 @@
 #pragma once
 #include <string>
 namespace bytedance::bolt::functions::prestosql {
+
 void registerArithmeticFunctions(const std::string& prefix = "");
 
 void registerCheckedArithmeticFunctions(const std::string& prefix = "");
