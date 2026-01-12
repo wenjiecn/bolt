@@ -235,7 +235,7 @@ class BoltConan(ConanFile):
 
     build_policy = "missing"
 
-    scm_url = "https://github.com/bytedance/bolt.git"
+    scm_url = "https://github.com/wenjiecn/bolt.git"
 
     def source(self):
         git = scm.Git(self)
@@ -249,8 +249,9 @@ class BoltConan(ConanFile):
         if self.channel and self.channel == "stable":
             if not self.version:
                 raise "Do specify a tag for a stable release."
-            cmd = f"tags/{self.version} -b tag-{self.version}"
+            cmd = f"{self.version}"
             git.checkout(cmd)
+            git.run(f"pull origin {self.version}")
         else:
             scm_branch = self.version
             if scm_branch != "main":
