@@ -628,8 +628,8 @@ RowVectorPtr HashAggregation::getOutput() {
   prepareOutput(maxOutputRows, supportRowBasedOutput_);
 
   if (expandNode_) {
-    return getRollupOutput(maxOutputRows, queryConfig,
-                           beforeMemorySize, accumulatorRowSize);
+    return getRollupOutput(
+        maxOutputRows, queryConfig, beforeMemorySize, accumulatorRowSize);
   }
 
   const bool hasData = groupingSet_->getOutput(
@@ -850,7 +850,7 @@ void HashAggregation::initProjection() {
   std::vector<column_index_t> groupingKeyInputChannels;
   for (auto i = 0; i < groupingKeys.size(); ++i) {
     groupingKeyInputChannels.push_back(
-      exprToChannel(groupingKeys[i].get(), inputType));
+        exprToChannel(groupingKeys[i].get(), inputType));
   }
   if (projectNode_) {
     std::unordered_map<column_index_t, column_index_t> channelMap;
@@ -861,16 +861,17 @@ void HashAggregation::initProjection() {
         if (inputs.empty() ||
             (inputs.size() == 1 &&
              dynamic_cast<const core::InputTypedExpr*>(inputs[0].get()))) {
-          const auto inputChannel = expandOutputType->getChildIdx(field->name());
+          const auto inputChannel =
+              expandOutputType->getChildIdx(field->name());
           channelMap[i] = inputChannel;
         }
       }
     }
-    for(auto col : groupingKeyInputChannels) {
+    for (auto col : groupingKeyInputChannels) {
       expandOutputChannels.push_back(channelMap[col]);
     }
   } else {
-    for(auto col : groupingKeyInputChannels) {
+    for (auto col : groupingKeyInputChannels) {
       expandOutputChannels.push_back(col);
     }
   }
@@ -886,7 +887,7 @@ void HashAggregation::initProjection() {
         rowProjection.push_back(i);
         constantProjection.push_back(nullptr);
       } else if (
-        auto constant = core::TypedExprs::asConstant(columnProjection)) {
+          auto constant = core::TypedExprs::asConstant(columnProjection)) {
         rowProjection.push_back(kConstantChannel);
         constantProjection.push_back(constant);
       } else {
@@ -906,16 +907,16 @@ void HashAggregation::initRollupAgg() {
   }
   groupingSetsRollUp_.resize(fieldProjections_.size());
   auto rollupAggregationNode = createIntermediateOrFinalAggregation(
-                                core::AggregationNode::Step::kIntermediate, 
-                                aggregationNode_);
+      core::AggregationNode::Step::kIntermediate, aggregationNode_);
   const auto& inputType = outputType_;
-  for (int groupIndex = 0; groupIndex<fieldProjections_.size(); groupIndex++) {
+  for (int groupIndex = 0; groupIndex < fieldProjections_.size();
+       groupIndex++) {
     if (groupIndex == 0) {
       groupingSetsRollUp_[groupIndex] = groupingSet_;
       continue;
     }
     auto hashers =
-      createVectorHashers(inputType, rollupAggregationNode->groupingKeys());
+        createVectorHashers(inputType, rollupAggregationNode->groupingKeys());
     auto numHashers = hashers.size();
 
     std::vector<column_index_t> preGroupedChannels;
@@ -963,7 +964,8 @@ void HashAggregation::initRollupAgg() {
         operatorCtx_.get());
 
     groupingSetsRollUp_[groupIndex]->setPreferPartialSpill(preferPartialSpill_);
-    groupingSetsRollUp_[groupIndex]->setSupportRowBasedOutput(supportRowBasedOutput_);
+    groupingSetsRollUp_[groupIndex]->setSupportRowBasedOutput(
+        supportRowBasedOutput_);
     groupingSetsRollUp_[groupIndex]->setSupportUniqueRowOptimization(
         operatorCtx_->driverCtx()
             ->queryConfig()
@@ -972,8 +974,11 @@ void HashAggregation::initRollupAgg() {
   rollupAggregationNode.reset();
 }
 
-RowVectorPtr HashAggregation::rollupProjection(RowVectorPtr input, int32_t rowIndex) {
-  if (rowIndex >= fieldProjections_.size() || input == nullptr || expandNode_ == nullptr) {
+RowVectorPtr HashAggregation::rollupProjection(
+    RowVectorPtr input,
+    int32_t rowIndex) {
+  if (rowIndex >= fieldProjections_.size() || input == nullptr ||
+      expandNode_ == nullptr) {
     return nullptr;
   }
   const auto numInput = input->size();
@@ -1006,23 +1011,25 @@ RowVectorPtr HashAggregation::rollupProjection(RowVectorPtr input, int32_t rowIn
       pool(), outputType_, nullptr, numInput, std::move(inputProjection));
 }
 
-RowVectorPtr HashAggregation::getRollupOutput(uint32_t maxOutputRows,
-                                  const core::QueryConfig& queryConfig,
-                                  int64_t beforeMemorySize,
-                                  uint64_t accumulatorRowSize) {
+RowVectorPtr HashAggregation::getRollupOutput(
+    uint32_t maxOutputRows,
+    const core::QueryConfig& queryConfig,
+    int64_t beforeMemorySize,
+    uint64_t accumulatorRowSize) {
   RowVectorPtr rollupInput;
   bool hasData = true;
   while (true) {
     hasData = groupingSet_->getOutput(
-      maxOutputRows,
-      queryConfig.preferredOutputBatchBytes(),
-      resultIterator_,
-      output_);
+        maxOutputRows,
+        queryConfig.preferredOutputBatchBytes(),
+        resultIterator_,
+        output_);
     if (hasData) {
       if (groupingSetIndex < groupingSetsRollUp_.size() - 1) {
         rollupInput = rollupProjection(output_, groupingSetIndex + 1);
         rollUpNumInputRows_ += rollupInput->size();
-        groupingSetsRollUp_[groupingSetIndex + 1]->addInput(rollupInput, mayPushdown_);
+        groupingSetsRollUp_[groupingSetIndex + 1]->addInput(
+            rollupInput, mayPushdown_);
       }
       numOutputRows_ += output_->size();
       recordRuntimeMetrics();
@@ -1062,7 +1069,8 @@ RowVectorPtr HashAggregation::getRollupOutput(uint32_t maxOutputRows,
   }
 }
 
-std::shared_ptr<const core::AggregationNode> HashAggregation::createIntermediateOrFinalAggregation(
+std::shared_ptr<const core::AggregationNode>
+HashAggregation::createIntermediateOrFinalAggregation(
     core::AggregationNode::Step step,
     std::shared_ptr<const core::AggregationNode> partialAggNode) {
   // Create intermediate or final aggregation using same grouping keys and same
@@ -1086,10 +1094,9 @@ std::shared_ptr<const core::AggregationNode> HashAggregation::createIntermediate
     }
     auto inputIndex = numGroupingKeys + i;
     std::vector<core::TypedExprPtr> inputs = {
-      std::make_shared<core::FieldAccessTypedExpr>(
-        partialOutputType->childAt(inputIndex), 
-        partialOutputType->names()[inputIndex])
-    };
+        std::make_shared<core::FieldAccessTypedExpr>(
+            partialOutputType->childAt(inputIndex),
+            partialOutputType->names()[inputIndex])};
 
     // Add lambda inputs.
     for (const auto& rawInput : rawInputs) {
@@ -1098,8 +1105,8 @@ std::shared_ptr<const core::AggregationNode> HashAggregation::createIntermediate
       }
     }
 
-    aggregate.call =
-        std::make_shared<core::CallTypedExpr>(partialAggregates[i].call->type(), std::move(inputs), name);
+    aggregate.call = std::make_shared<core::CallTypedExpr>(
+        partialAggregates[i].call->type(), std::move(inputs), name);
     aggregates.emplace_back(aggregate);
   }
 

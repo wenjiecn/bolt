@@ -115,14 +115,16 @@ class HashAggregation : public Operator {
 
   void initRollupAgg();
 
-RowVectorPtr getRollupOutput(uint32_t maxOutputRows,
-                             const core::QueryConfig& queryConfig,
-                             int64_t beforeMemorySize,
-                             uint64_t accumulatorRowSize);
+  RowVectorPtr getRollupOutput(
+      uint32_t maxOutputRows,
+      const core::QueryConfig& queryConfig,
+      int64_t beforeMemorySize,
+      uint64_t accumulatorRowSize);
 
-  std::shared_ptr<const core::AggregationNode> createIntermediateOrFinalAggregation(
-    core::AggregationNode::Step step,
-    std::shared_ptr<const core::AggregationNode> partialAggNode);
+  std::shared_ptr<const core::AggregationNode>
+  createIntermediateOrFinalAggregation(
+      core::AggregationNode::Step step,
+      std::shared_ptr<const core::AggregationNode> partialAggNode);
 
   const bool isPartialOutput_;
   const bool isPartialStep_;
