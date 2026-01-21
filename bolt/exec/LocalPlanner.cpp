@@ -807,7 +807,6 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     } else if (
         auto expandNode =
             std::dynamic_pointer_cast<const core::ExpandNode>(planNode)) {
-#if defined(__ARM_FEATURE_SVE) && defined(__aarch64__)
       if (i < planNodes.size() - 1) {
         auto next = planNodes[i + 1];
         std::shared_ptr<const core::AggregationNode> aggregationNode =
@@ -847,7 +846,6 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
           continue;
         }
       }
-#endif
       operators.push_back(std::make_unique<Expand>(id, ctx.get(), expandNode));
     } else if (
         auto groupIdNode =
