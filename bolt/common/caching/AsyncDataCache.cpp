@@ -300,9 +300,7 @@ bool CoalescedLoad::loadOrFuture(folly::SemiFuture<bool>* wait) {
     setEndState(State::kLoading, State::kLoaded, State::kCancelled);
   } catch (std::exception& e) {
     // preload can fail in async thread, then retry in sync load
-    if (isAsyncPreloadThread() &&
-        std::string(e.what()).find(kAsyncPreloadThreadName) !=
-            std::string::npos) {
+    if (isAsyncPreloadThread()) {
       LOG(WARNING) << "thread " << folly::getCurrentThreadName().value()
                    << " CoalescedLoad " << (uint64_t)this << " state "
                    << (state_ == State::kLoading         ? "kLoading"
@@ -645,6 +643,9 @@ AsyncDataCache::AsyncDataCache(
   }
 }
 
+AsyncDataCache::AsyncDataCache(memory::MemoryAllocator* allocator)
+    : AsyncDataCache(allocator, nullptr) {}
+
 AsyncDataCache::~AsyncDataCache() {}
 
 // static
@@ -654,6 +655,11 @@ std::shared_ptr<AsyncDataCache> AsyncDataCache::create(
   auto cache = std::make_shared<AsyncDataCache>(allocator, std::move(ssdCache));
   allocator->registerCache(cache);
   return cache;
+}
+
+std::shared_ptr<AsyncDataCache> AsyncDataCache::create(
+    memory::MemoryAllocator* allocator) {
+  return AsyncDataCache::create(allocator, nullptr);
 }
 
 // static

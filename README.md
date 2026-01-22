@@ -53,31 +53,51 @@ git clone https://github.com/bytedance/bolt.git
 cd bolt
 ```
 
-### Using Conan as the package manager
-[Conan](https://conan.io/) is an open source and multi-platform package manager.
-We provide scripts to help developers setup and install Bolt dependencies.
-
+### Setup Develop Env
+We provide scripts to help developers configure the environment and install dependencies.
 ```shell
 scripts/setup-dev-env.sh
 ```
 
-This script only exports conan recipes to local cache. For the first time, dependencies will be built from source and installed into local cache. You can setup your own [conan server](https://docs.conan.io/2/reference/conan_server.html#conan-server) to accelerate building.
+Bolt uses [Conan](https://conan.io/) as its dependency management tool, which is an open source and multi-platform package manager.
+
+This script exports conan recipes to local cache. For the first time, dependencies will be built from source and installed into local cache. You can setup your own [conan server](https://docs.conan.io/2/reference/conan_server.html#conan-server) to accelerate building.
 
 ### Building Bolt
+#### Building Bolt for Presto
 
 Run `make` in the root directory to compile the sources. For development, use
 `make debug` to build a non-optimized debug version, or `make release` to build
 an optimized version.  Use `make unittest` to build and run tests.
 
 ```shell
-# building bolt for spark
-make release_spark
+make release
 
 # In main branch, by default, BUILD_VERSION is main.
-make release_spark BUILD_VERSION=main
+make release BUILD_VERSION=main
 ```
 
-### Importing Bolt as a library
+#### Building Bolt for [Gluten](https://gluten.apache.org/)
+Before you begin, please ensure that the following software is present in your environment: JDK (currently only JDK 11 and JDK 17 are supported), Maven, and curl.
+
+First, you need to compile Bolt, and then export Bolt as a library.
+```shell
+cd bolt
+make release_spark
+make export_release
+```
+
+Then you can compile Gluten that supports Bolt.
+```shell
+git clone -b add_bolt_backend https://github.com/WangGuangxin/gluten.git
+cd gluten
+make arrow
+make release
+make jar
+```
+
+#### Building Bolt for other system
+You can use the `make release && make export_release` command to compile and export Bolt, and then use conan to reference Bolt. Below is a conanfile example that references Bolt as a third-party dependency.
 
 ```python
 # Take gluten for example:

@@ -36,6 +36,7 @@
 #include "bolt/common/base/BitUtil.h"
 #include "bolt/common/base/CheckedArithmetic.h"
 #include "bolt/common/base/Exceptions.h"
+#include "bolt/functions/prestosql/types/TimestampWithTimeZoneType.h"
 #include "bolt/vector/ComplexVector.h"
 #include "bolt/vector/DictionaryVector.h"
 #include "bolt/vector/FlatVector.h"
@@ -312,6 +313,9 @@ const char* exportArrowFormatStr(
       }
       return "i"; // int32
     case TypeKind::BIGINT:
+      if (type->isIntervalDayTime()) {
+        return "tiD";
+      }
       return "l"; // int64
     case TypeKind::REAL:
       return "f"; // float32
@@ -472,6 +476,78 @@ void gatherFromTimestampBuffer(
     default:
       BOLT_UNREACHABLE();
   }
+}
+
+void gatherFromTimestampBufferIPC(
+    const BaseVector& vec,
+    const Selection& rows,
+    TimestampUnit unit,
+    Buffer& out) {
+  auto src = (*vec.values()).as<Timestamp>();
+  auto dst = out.asMutable<int64_t>();
+  vector_size_t j = 0;
+
+  auto safeConv = [&](const Timestamp& ts, int64_t* outVal) -> bool {
+    const int64_t sec = ts.getSeconds();
+    const int64_t nanos = ts.getNanos();
+
+    if (UNLIKELY(nanos < 0 || nanos >= 1000000000LL)) {
+      return false;
+    }
+
+    __int128 v = 0;
+    switch (unit) {
+      case TimestampUnit::kSecond:
+        v = static_cast<__int128>(sec);
+        break;
+      case TimestampUnit::kMilli:
+        // sec * 1'000 + nanos / 1'000'000
+        v = static_cast<__int128>(sec) * 1000 + nanos / 1000000;
+        break;
+      case TimestampUnit::kMicro:
+        // sec * 1'000'000 + nanos / 1'000
+        v = static_cast<__int128>(sec) * 1000000 + nanos / 1000;
+        break;
+      case TimestampUnit::kNano:
+        // sec * 1'000'000'000 + nanos
+        v = static_cast<__int128>(sec) * 1000000000 + nanos;
+        break;
+      default:
+        BOLT_UNREACHABLE();
+    }
+
+    if (UNLIKELY(
+            v > std::numeric_limits<int64_t>::max() ||
+            v < std::numeric_limits<int64_t>::min())) {
+      return false;
+    }
+
+    *outVal = static_cast<int64_t>(v);
+    return true;
+  };
+
+  auto writeOrZero = [&](vector_size_t i) {
+    int64_t v;
+    if (LIKELY(safeConv(src[i], &v))) {
+      dst[j] = v;
+    } else {
+      dst[j] = 0;
+    }
+    ++j;
+  };
+
+  if (!vec.mayHaveNulls()) {
+    rows.apply(writeOrZero);
+    return;
+  }
+
+  rows.apply([&](vector_size_t i) {
+    if (!vec.isNullAt(i)) {
+      writeOrZero(i);
+    } else {
+      ++j;
+    }
+  });
 }
 
 void gatherFromBuffer(
@@ -686,6 +762,18 @@ void exportValidityBitmap(
     ArrowArray& out,
     memory::MemoryPool* pool,
     BoltToArrowBridgeHolder& holder) {
+  if (options.exportToArrowIPC && vec.typeKind() == TypeKind::UNKNOWN) {
+    out.null_count = rows.count();
+    if (vec.encoding() == VectorEncoding::Simple::DICTIONARY) {
+      auto nulls =
+          AlignedBuffer::allocate<char>(bits::nbytes(out.length), pool);
+      auto raw = nulls->asMutable<uint64_t>();
+      bits::fillBits(raw, 0, out.length, bits::kNull);
+      holder.setBuffer(0, nulls);
+    }
+    return;
+  }
+
   if (!vec.nulls()) {
     out.null_count = 0;
     return;
@@ -782,7 +870,11 @@ void exportValues(
       : AlignedBuffer::allocate<uint8_t>(
             checkedMultiply<size_t>(out.length, size), pool);
   if (type->kind() == TypeKind::TIMESTAMP) {
-    gatherFromTimestampBuffer(vec, rows, options.timestampUnit, *values);
+    if (options.exportToArrowIPC) {
+      gatherFromTimestampBufferIPC(vec, rows, options.timestampUnit, *values);
+    } else {
+      gatherFromTimestampBuffer(vec, rows, options.timestampUnit, *values);
+    }
   } else {
     gatherFromBuffer(*type, *vec.values(), rows, options, *values);
   }
@@ -798,6 +890,63 @@ void exportViews(
     BoltToArrowBridgeHolder& holder) {
   auto stringBuffers = vec.stringBuffers();
   size_t numStringBuffers = stringBuffers.size();
+  size_t nonInlineCnt = 0, scanned = 0;
+  rows.apply([&](vector_size_t i) {
+    ++scanned;
+    if (!vec.isNullAt(i) && !vec.valueAtFast(i).isInline())
+      ++nonInlineCnt;
+  });
+  bool rebuiltFallback = false;
+  std::vector<uint64_t> fbOffsets;
+  BufferPtr fbBuf;
+  constexpr uint64_t kNoOffset = ~uint64_t{0};
+
+  if (nonInlineCnt > 0 && numStringBuffers == 0 && options.exportToArrowIPC) {
+    LOG(ERROR) << "[exportViews] non-inline strings but stringBuffers empty!";
+    std::vector<uint64_t> fbOffsets;
+    BufferPtr fbBuf;
+    constexpr uint64_t kNoOffset = ~uint64_t{0};
+
+    if (nonInlineCnt > 0 && numStringBuffers == 0) {
+      LOG(WARNING) << "[exportViews] building fallback single string buffer";
+      size_t totalBytes = 0;
+      rows.apply([&](vector_size_t i) {
+        if (!vec.isNullAt(i)) {
+          auto sv = vec.valueAtFast(i);
+          if (!sv.isInline())
+            totalBytes += sv.size();
+        }
+      });
+
+      if (totalBytes > 0) {
+        fbBuf = AlignedBuffer::allocate<char>(totalBytes, pool);
+        char* dst = fbBuf->asMutable<char>();
+
+        fbOffsets.assign(out.length, kNoOffset);
+        size_t cursor = 0;
+        vector_size_t j = 0;
+        rows.apply([&](vector_size_t i) {
+          if (!vec.isNullAt(i)) {
+            auto sv = vec.valueAtFast(i);
+            if (!sv.isInline() && sv.size() > 0) {
+              memcpy(dst + cursor, sv.data(), sv.size());
+              fbOffsets[j] = cursor;
+              cursor += sv.size();
+            }
+          }
+          ++j;
+        });
+
+        stringBuffers.clear();
+        stringBuffers.push_back(fbBuf);
+        numStringBuffers = 1;
+      } else {
+        LOG(WARNING)
+            << "[exportViews] only inline/null strings; keeping buffers empty";
+      }
+    }
+  }
+
   size_t numBuffers = 3 +
       numStringBuffers; // nulls, values, stringBuffers, variadic_buffer_sizes
 
@@ -852,6 +1001,15 @@ void exportViews(
     auto* view = (uint32_t*)&utf8Views[2 * i];
     if (!(rawNulls && bits::isBitNull(rawNulls, i)) && view[0] > 12) {
       ensureWritable(i, &view);
+
+      if (options.exportToArrowIPC && rebuiltFallback) {
+        uint64_t off = (i < fbOffsets.size() && fbOffsets[i] != kNoOffset)
+            ? fbOffsets[i]
+            : 0;
+        view[2] = 0;
+        view[3] = static_cast<uint32_t>(off);
+        continue;
+      }
 
       uint64_t currAddr = *(uint64_t*)&view[2];
       if (i == 0 || currAddr < bufferAddrCache ||
@@ -936,6 +1094,9 @@ void exportFlat(
       exportValues(vec, rows, options, out, pool, holder);
       break;
     case TypeKind::UNKNOWN:
+      if (options.exportToArrowIPC) {
+        out.n_buffers = 0;
+      }
       break;
     case TypeKind::VARCHAR:
     case TypeKind::VARBINARY:
@@ -985,6 +1146,7 @@ void exportRows(
     ArrowArray& out,
     memory::MemoryPool* pool,
     BoltToArrowBridgeHolder& holder) {
+  exportValidityBitmap(vec, rows, options, out, pool, holder);
   out.n_buffers = 1;
   holder.resizeChildren(vec.childrenSize());
   out.n_children = vec.childrenSize();
@@ -1053,6 +1215,69 @@ void exportOffsets(
   out.n_buffers = 2;
 }
 
+template <typename Vector>
+void exportOffsetsIPC(
+    const Vector& vec,
+    const Selection& rows,
+    ArrowArray& out,
+    memory::MemoryPool* pool,
+    BoltToArrowBridgeHolder& holder,
+    Selection& childRows) {
+  auto offsets = AlignedBuffer::allocate<vector_size_t>(
+      checkedPlus<size_t>(out.length, 1), pool);
+  auto rawOffsets = offsets->asMutable<vector_size_t>();
+  if (!rows.changed() && isCompact(vec)) {
+    const vector_size_t m = out.length;
+    BOLT_DCHECK_EQ(m, vec.size(), "fast path assumes out.length == vec.size()");
+
+    memcpy(rawOffsets, vec.rawOffsets(), sizeof(vector_size_t) * m);
+
+    const vector_size_t base = (m == 0) ? 0 : rawOffsets[0];
+    const vector_size_t end =
+        (m == 0) ? 0 : vec.offsetAt(m - 1) + vec.sizeAt(m - 1);
+
+    if (base != 0) {
+      for (vector_size_t i = 0; i < m; ++i) {
+        rawOffsets[i] -= base;
+      }
+    }
+    rawOffsets[m] = end - base;
+
+    vector_size_t childTotal = 0;
+    if constexpr (std::is_same_v<Vector, ArrayVector>) {
+      childTotal = vec.elements()->size();
+    } else {
+      static_assert(
+          std::is_same_v<Vector, MapVector>,
+          "exportOffsetsIPC expects ArrayVector or MapVector");
+      childTotal = vec.mapKeys()->size();
+    }
+
+    if (!(base == 0 && end == childTotal)) {
+      childRows.clearAll();
+      if (end > base) {
+        childRows.addRange(base, end - base);
+      }
+    }
+  } else {
+    childRows.clearAll();
+    // j: Index of element we are writing.
+    // k: Total size so far.
+    vector_size_t j = 0, k = 0;
+    rows.apply([&](vector_size_t i) {
+      rawOffsets[j++] = k;
+      if (!vec.isNullAt(i)) {
+        childRows.addRange(vec.offsetAt(i), vec.sizeAt(i));
+        k += vec.sizeAt(i);
+      }
+    });
+    BOLT_DCHECK_EQ(j, out.length);
+    rawOffsets[j] = k;
+  }
+  holder.setBuffer(1, offsets);
+  out.n_buffers = 2;
+}
+
 void exportArrays(
     const ArrayVector& vec,
     const Selection& rows,
@@ -1061,7 +1286,12 @@ void exportArrays(
     memory::MemoryPool* pool,
     BoltToArrowBridgeHolder& holder) {
   Selection childRows(vec.elements()->size());
-  exportOffsets(vec, rows, out, pool, holder, childRows);
+  if (options.exportToArrowIPC) {
+    exportOffsetsIPC(vec, rows, out, pool, holder, childRows);
+  } else {
+    exportOffsets(vec, rows, out, pool, holder, childRows);
+  }
+
   holder.resizeChildren(1);
   exportToArrowImpl(
       *vec.elements()->loadedVector(),
@@ -1087,7 +1317,12 @@ void exportMaps(
       vec.mapKeys()->size(),
       {vec.mapKeys(), vec.mapValues()});
   Selection childRows(child.size());
-  exportOffsets(vec, rows, out, pool, holder, childRows);
+  if (options.exportToArrowIPC) {
+    exportOffsetsIPC(vec, rows, out, pool, holder, childRows);
+  } else {
+    exportOffsets(vec, rows, out, pool, holder, childRows);
+  }
+
   holder.resizeChildren(1);
   exportToArrowImpl(child, childRows, options, *holder.allocateChild(0), pool);
   out.n_children = 1;
@@ -1136,63 +1371,23 @@ void flattenAndExport(
   }
 }
 
-template <TypeKind kind>
-void flattenAndExportArrayVector(
-    const DecodedVector& decoded,
-    const Selection& rows,
-    const ArrowOptions& options,
-    ArrowArray& out,
-    memory::MemoryPool* pool,
-    BoltToArrowBridgeHolder& holder) {
-  using T = typename bolt::TypeTraits<kind>::NativeType;
-
-  auto arrayVector = decoded.base()->asUnchecked<ArrayVector>();
-  auto elements = arrayVector->elements();
-  vector_size_t dictionarySize = decoded.size();
-
-  BufferPtr offsets =
-      AlignedBuffer::allocate<vector_size_t>(dictionarySize, pool);
-  BufferPtr sizes =
-      AlignedBuffer::allocate<vector_size_t>(dictionarySize, pool);
-
-  auto rawOffsets = offsets->asMutable<vector_size_t>();
-  auto rawSizes = sizes->asMutable<vector_size_t>();
-
-  vector_size_t numElements = 0;
-  vector_size_t indexPtr = 0;
-
-  for (vector_size_t i = 0; i < dictionarySize; ++i) {
-    vector_size_t idx = decoded.index(i);
-    numElements += !decoded.isNullAt(i) ? arrayVector->sizeAt(idx) : 0;
+static BufferPtr clampWrapInfoSize(const BaseVector& v) {
+  auto* buf = v.wrapInfo().get();
+  if (!buf)
+    return nullptr;
+  const auto need = sizeof(vector_size_t) * static_cast<size_t>(v.size());
+  const auto have = v.wrapInfo()->size();
+  BOLT_USER_CHECK_GE(
+      have,
+      need,
+      "[dict] wrapInfo smaller than expected: bytes={} expect={}",
+      have,
+      need);
+  if (have == need) {
+    return v.wrapInfo();
   }
-
-  const TypePtr& type = ARRAY(CppToType<T>::create());
-  using V = typename CppToType<T>::NativeType;
-  auto flatVector =
-      BaseVector::create<FlatVector<V>>(type->childAt(0), numElements, pool);
-  auto resArrayVector = std::make_shared<ArrayVector>(
-      pool, type, nullptr, dictionarySize, offsets, sizes, flatVector);
-
-  vector_size_t currentIdx = 0;
-  for (vector_size_t i = 0; i < dictionarySize; ++i) {
-    vector_size_t idx = decoded.index(i);
-
-    *rawSizes++ = !decoded.isNullAt(i) ? arrayVector->sizeAt(idx) : 0;
-    *rawOffsets++ = currentIdx;
-
-    if (!decoded.isNullAt(i)) {
-      vector_size_t arraySize = arrayVector->sizeAt(idx);
-      vector_size_t arrayOffset = arrayVector->offsetAt(idx);
-      flatVector->copy(elements.get(), currentIdx, arrayOffset, arraySize);
-
-      currentIdx += arraySize;
-    } else {
-      resArrayVector->setNull(i, true);
-    }
-  }
-
-  exportValidityBitmap(*resArrayVector, rows, options, out, pool, holder);
-  exportArrays(*resArrayVector, rows, options, out, pool, holder);
+  // zero-copy view for exact size
+  return wrapInBufferViewAsViewer(v.wrapInfo()->as<void>(), need);
 }
 
 void exportDictionary(
@@ -1204,12 +1399,123 @@ void exportDictionary(
     BoltToArrowBridgeHolder& holder) {
   out.n_buffers = 2;
   out.n_children = 0;
+  if (options.exportToArrowIPC && !options.flattenDictionary) {
+    const BaseVector* cur = vec.valueVector()->loadedVector();
+    const bool nested = (cur->encoding() == VectorEncoding::Simple::DICTIONARY);
+
+    // Dict in Dict
+    if (nested) {
+      // Arrow IPC does not allow dict in dic
+      // Need to make to 1 level dict.
+      auto nbuf = holder.getBufferPtr(0);
+      BufferPtr composed =
+          AlignedBuffer::allocate<vector_size_t>(out.length, pool);
+      BufferPtr clamped = clampWrapInfoSize(vec);
+
+      if (rows.changed()) {
+        gatherFromBuffer(*INTEGER(), *clamped, rows, options, *composed);
+      } else {
+        memcpy(
+            composed->asMutable<void>(),
+            clamped->as<void>(),
+            sizeof(vector_size_t) * out.length);
+      }
+      auto* acc = composed->asMutable<vector_size_t>();
+
+      std::vector<uint8_t> overlayNull(out.length, 0);
+      if (vec.mayHaveNulls()) {
+        vector_size_t j = 0;
+        rows.apply([&](vector_size_t i) {
+          overlayNull[j++] = vec.isNullAt(i) ? 1 : 0;
+        });
+      }
+      BOLT_USER_CHECK_EQ(
+          clamped->size(),
+          sizeof(vector_size_t) * vec.size(),
+          "[dict.nested] wrapInfo size mismatch: bytes={} expect={}",
+          clamped->size(),
+          sizeof(vector_size_t) * vec.size());
+
+      size_t overlayNullCnt = 0;
+      for (vector_size_t j = 0; j < out.length; ++j)
+        overlayNullCnt += overlayNull[j];
+
+      // flatten to 1-leve dict
+      while (cur->encoding() == VectorEncoding::Simple::DICTIONARY) {
+        const auto* innerIdx = cur->wrapInfo()->as<const vector_size_t>();
+
+        const size_t innerN = cur->size();
+
+        for (vector_size_t j = 0; j < out.length; ++j) {
+          if (!overlayNull[j]) {
+            acc[j] = innerIdx[acc[j]];
+          }
+        }
+        cur = cur->valueVector()->loadedVector();
+      }
+
+      BufferPtr outNulls = holder.getBufferPtr(0);
+      const uint64_t* baseNulls = cur->nulls() ? cur->rawNulls() : nullptr;
+
+      int64_t finalNullCount = 0;
+
+      for (vector_size_t j = 0; j < out.length; ++j) {
+        const bool baseIsNull = baseNulls && bits::isBitNull(baseNulls, acc[j]);
+        if (overlayNull[j] || baseIsNull) {
+          ++finalNullCount;
+        }
+      }
+
+      if (finalNullCount > 0) {
+        // for null bit, not to write on view buffer. get ownership
+        auto ensureOwnedNulls = [&](bool copyExisting) -> uint64_t* {
+          const size_t bytes = bits::nbytes(out.length);
+          if (outNulls && !outNulls->isView()) {
+            return outNulls->asMutable<uint64_t>();
+          }
+          // new owned buffer, memcpy if need
+          auto owned = AlignedBuffer::allocate<char>(bytes, pool);
+          auto* raw = owned->asMutable<uint64_t>();
+          if (outNulls && copyExisting) {
+            memcpy(raw, outNulls->as<void>(), bytes);
+          } else {
+            bits::fillBits(raw, 0, out.length, bits::kNotNull);
+          }
+          holder.setBuffer(0, owned);
+          outNulls = std::move(owned);
+          return raw;
+        };
+
+        uint64_t* rawOutNulls = ensureOwnedNulls(true);
+
+        for (vector_size_t j = 0; j < out.length; ++j) {
+          bool isNull = overlayNull[j] ||
+              (baseNulls && bits::isBitNull(baseNulls, acc[j]));
+          if (isNull) {
+            acc[j] = 0;
+            bits::setNull(rawOutNulls, j);
+          }
+        }
+
+        out.null_count = finalNullCount;
+      } else {
+        out.null_count = 0;
+      }
+
+      holder.setBuffer(1, composed);
+      out.dictionary = holder.allocateDictionary();
+      exportToArrowImpl(
+          *cur, Selection(cur->size()), options, *out.dictionary, pool);
+      return;
+    }
+  }
+
   if (rows.changed()) {
     auto indices = AlignedBuffer::allocate<vector_size_t>(out.length, pool);
     gatherFromBuffer(*INTEGER(), *vec.wrapInfo(), rows, options, *indices);
     holder.setBuffer(1, indices);
   } else {
-    holder.setBuffer(1, vec.wrapInfo());
+    holder.setBuffer(1, clampWrapInfoSize(vec));
   }
   auto& values = *vec.valueVector()->loadedVector();
   out.dictionary = holder.allocateDictionary();
@@ -1224,23 +1530,66 @@ void exportFlattenedVector(
     ArrowArray& out,
     memory::MemoryPool* pool,
     BoltToArrowBridgeHolder& holder) {
-  if (vec.valueVector() != nullptr &&
-      vec.wrappedVector()->encoding() == VectorEncoding::Simple::ARRAY) {
-    DecodedVector decoded(vec, false);
+  if (options.exportToArrowIPC && vec.typeKind() == TypeKind::UNKNOWN) {
+    out.n_children = 0;
+    out.children = nullptr;
+    out.n_buffers = 0;
+    return;
+  }
+  if (vec.typeKind() == TypeKind::ARRAY || vec.typeKind() == TypeKind::MAP ||
+      vec.typeKind() == TypeKind::ROW) {
+    std::vector<vector_size_t> toSource(rows.count());
+    vector_size_t idx = 0;
+    rows.apply([&](vector_size_t r) { toSource[idx++] = r; });
+    SelectivityVector targetRows(rows.count(), true);
+    auto flattenedVec = BaseVector::create(vec.type(), rows.count(), pool);
+    flattenedVec->copy(&vec, targetRows, toSource.data(), true);
 
-    auto values = decoded.base()->asUnchecked<ArrayVector>()->elements();
-    BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(
-        flattenAndExportArrayVector,
-        values->typeKind(),
-        decoded,
-        rows,
+    exportValidityBitmap(
+        *flattenedVec,
+        Selection(flattenedVec->size()),
         options,
         out,
         pool,
         holder);
+    switch (flattenedVec->encoding()) {
+      case VectorEncoding::Simple::ROW: {
+        exportRows(
+            *flattenedVec->asUnchecked<RowVector>(),
+            Selection(flattenedVec->size()),
+            options,
+            out,
+            pool,
+            holder);
+        break;
+      }
+      case VectorEncoding::Simple::ARRAY: {
+        exportArrays(
+            *flattenedVec->asUnchecked<ArrayVector>(),
+            Selection(flattenedVec->size()),
+            options,
+            out,
+            pool,
+            holder);
+        break;
+      }
+      case VectorEncoding::Simple::MAP: {
+        exportMaps(
+            *flattenedVec->asUnchecked<MapVector>(),
+            Selection(flattenedVec->size()),
+            options,
+            out,
+            pool,
+            holder);
+        break;
+      }
+      default:
+        BOLT_UNREACHABLE();
+    }
   } else {
     BOLT_CHECK(
-        vec.valueVector() == nullptr || vec.wrappedVector()->isFlatEncoding(),
+        vec.valueVector() == nullptr || vec.wrappedVector()->isFlatEncoding() ||
+            vec.wrappedVector()->encoding() == VectorEncoding::Simple::CONSTANT,
         fmt::format(
             "An unsupported nested encoding was found: {}.",
             vec.valueVector() == nullptr
@@ -1275,22 +1624,49 @@ void exportConstantValue(
     selection.clearAll();
     selection.addRange(vec.as<ConstantVector<ComplexType>>()->index(), 1);
   } else {
-    // If this is a scalar type, then ConstantVector does not have a vector
-    // inside. Wrap the single value in a flat vector with a single element to
-    // export it to an ArrowArray.
-    size_t bufferSize = (vec.type()->isVarchar() || vec.type()->isVarbinary())
-        ? sizeof(StringView)
-        : vec.type()->cppSizeInBytes();
+    const bool isStr = vec.type()->isVarchar() || vec.type()->isVarbinary();
+    if (isStr && options.exportToArrowIPC) {
+      const auto sv = *reinterpret_cast<const StringView*>(vec.valuesAsVoid());
 
-    valuesVector = BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(
-        createFlatVector,
-        vec.typeKind(),
-        pool,
-        vec.type(),
-        vec.nulls(),
-        1,
-        wrapInBufferViewAsViewer(vec.valuesAsVoid(), bufferSize),
-        vec.mayHaveNulls() ? 1 : 0);
+      auto stringViews = AlignedBuffer::allocate<StringView>(1, pool);
+      auto* rawSV = stringViews->asMutable<StringView>();
+      rawSV[0] = sv;
+
+      std::vector<BufferPtr> stringViewBuffers;
+      if (!sv.isInline() && sv.size() > 0) {
+        auto dataBuf = AlignedBuffer::allocate<char>(sv.size(), pool);
+        std::memcpy(dataBuf->asMutable<char>(), sv.data(), sv.size());
+        rawSV[0] = StringView(dataBuf->as<char>(), sv.size());
+        stringViewBuffers.emplace_back(std::move(dataBuf));
+      }
+      valuesVector = std::make_shared<FlatVector<StringView>>(
+          pool,
+          vec.type(),
+          vec.nulls(),
+          1,
+          std::move(stringViews),
+          std::move(stringViewBuffers),
+          SimpleVectorStats<StringView>{},
+          std::nullopt,
+          optionalNullCount(vec.mayHaveNulls() ? 1 : 0));
+    } else {
+      // If this is a scalar type, then ConstantVector does not have a vector
+      // inside. Wrap the single value in a flat vector with a single element to
+      // export it to an ArrowArray.
+      size_t bufferSize = (vec.type()->isVarchar() || vec.type()->isVarbinary())
+          ? sizeof(StringView)
+          : vec.type()->cppSizeInBytes();
+
+      valuesVector = BOLT_DYNAMIC_SCALAR_TYPE_DISPATCH(
+          createFlatVector,
+          vec.typeKind(),
+          pool,
+          vec.type(),
+          vec.nulls(),
+          1,
+          wrapInBufferViewAsViewer(vec.valuesAsVoid(), bufferSize),
+          vec.mayHaveNulls() ? 1 : 0);
+    }
   }
   exportToArrowImpl(*valuesVector, selection, options, out, pool);
 }
@@ -1478,6 +1854,9 @@ TypePtr importFromArrowImpl(
       if (format[1] == 'i' && format[2] == 'M') {
         return INTERVAL_YEAR_MONTH();
       }
+      if (format[1] == 'i' && format[2] == 'D') {
+        return INTERVAL_DAY_TIME();
+      }
       break;
 
     case 'd':
@@ -1523,6 +1902,25 @@ TypePtr importFromArrowImpl(
                     ? arrowSchema.children[i]->name
                     : "");
           }
+
+          // for timestamp with timezone
+          auto isTwtz = [&]() -> bool {
+            if (childTypes.size() != 2) {
+              return false;
+            }
+            if (childTypes[0]->kind() != TypeKind::BIGINT ||
+                childTypes[1]->kind() != TypeKind::SMALLINT) {
+              return false;
+            }
+            const std::string n0 = childNames[0];
+            const std::string n1 = childNames[1];
+            return (n0 == "timestamp" && n1 == "timezone");
+          }();
+
+          if (isTwtz) {
+            return TIMESTAMP_WITH_TIME_ZONE();
+          }
+
           return ROW(std::move(childNames), std::move(childTypes));
         }
 
@@ -1545,6 +1943,108 @@ TypePtr importFromArrowImpl(
       "Unable to convert '{}' ArrowSchema format type to Bolt.", format);
 }
 
+void exportMapToArrowSchema(
+    const MapVector& maps,
+    ArrowSchema& arrowSchema,
+    const ArrowOptions& options,
+    BoltToArrowSchemaBridgeHolder* bridgeHolder,
+    memory::MemoryPool* pool) {
+  auto& type = maps.type();
+  // Need to wrap the key and value types in a struct type.
+  BOLT_DCHECK_EQ(type->size(), 2);
+  auto child = std::make_unique<ArrowSchema>();
+  auto rows = std::make_shared<RowVector>(
+      nullptr,
+      ROW({"key", "value"}, {type->childAt(0), type->childAt(1)}),
+      nullptr,
+      0,
+      std::vector<VectorPtr>{maps.mapKeys(), maps.mapValues()},
+      maps.getNullCount());
+  exportToArrow(rows, *child, options, {}, pool);
+  child->name = "entries";
+  // Map data should be a non-nullable struct type.
+  clearNullableFlag(child->flags);
+  // Map data key type should be non-nullable.
+  clearNullableFlag(child->children[0]->flags);
+  bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
+}
+
+void exportArrayToArrowSchema(
+    const ArrayVector& arrays,
+    ArrowSchema& arrowSchema,
+    const ArrowOptions& options,
+    BoltToArrowSchemaBridgeHolder* bridgeHolder,
+    memory::MemoryPool* pool) {
+  auto& type = arrays.type();
+  auto child = std::make_unique<ArrowSchema>();
+  BOLT_CHECK(
+      arrays.elements()->type()->equivalent(*type->asArray().elementType()),
+      "array vector child type: {}, type child: {}",
+      arrays.elements()->type()->toString(),
+      type->asArray().elementType()->toString());
+  exportToArrow(arrays.elements(), *child, options, {}, pool);
+  // Name is required, and "item" is the default name used in arrow itself.
+  child->name = "item";
+  bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
+}
+
+void exportRowToArrowSchema(
+    const RowVector& rows,
+    ArrowSchema& arrowSchema,
+    const ArrowOptions& options,
+    BoltToArrowSchemaBridgeHolder* bridgeHolder,
+    const std::vector<std::string>& fieldNames,
+    memory::MemoryPool* pool) {
+  auto& type = rows.type();
+  auto numChildren = rows.childrenSize();
+  bridgeHolder->childrenRaw.resize(numChildren);
+  bridgeHolder->childrenOwned.resize(numChildren);
+
+  // Hold the shared_ptr so we can set the ArrowSchema.name pointer to its
+  // internal `name` string.
+  bridgeHolder->rowType = std::static_pointer_cast<const RowType>(type);
+
+  arrowSchema.children = bridgeHolder->childrenRaw.data();
+  arrowSchema.n_children = numChildren;
+
+  for (size_t i = 0; i < numChildren; ++i) {
+    // Recurse down the children. We use the same trick of temporarily
+    // holding the buffer in a unique_ptr so it doesn't leak if the
+    // recursion throws.
+    //
+    // But this is more nuanced: for types with a list of children (like
+    // row/structs), if one of the children throws, we need to make sure we
+    // call release() on the children that have already been created before
+    // we re-throw the exception back to the client, or memory will leak.
+    // This is needed because Arrow doesn't define what the client needs to
+    // do if the conversion fails, so we can't expect the client to call the
+    // release() method.
+    try {
+      auto& currentSchema = bridgeHolder->childrenOwned[i];
+      currentSchema = std::make_unique<ArrowSchema>();
+      BOLT_CHECK(
+          rows.childAt(i)->type()->equivalent(*type->asRow().childAt(i)),
+          "row vector child index: {}, type: {}, type child: {}",
+          i,
+          rows.childAt(i)->type()->toString(),
+          type->asRow().childAt(i)->toString());
+      exportToArrow(rows.childAt(i), *currentSchema, options, {}, pool);
+      if (fieldNames.size() == numChildren) {
+        currentSchema->name = fieldNames[i].data();
+      } else {
+        currentSchema->name = bridgeHolder->rowType->nameOf(i).data();
+      }
+      arrowSchema.children[i] = currentSchema.get();
+    } catch (const BoltException&) {
+      // Release any children that have already been built before
+      // re-throwing the exception back to the client.
+      for (size_t j = 0; j < i; ++j) {
+        arrowSchema.children[j]->release(arrowSchema.children[j]);
+      }
+      throw;
+    }
+  }
+}
 } // namespace
 
 void exportToArrow(
@@ -1586,31 +2086,63 @@ void exportToArrow(
 
   if (vec->encoding() == VectorEncoding::Simple::DICTIONARY) {
     if (options.flattenDictionary) {
+      arrowSchema.format =
+          exportArrowFormatStr(type, options, bridgeHolder->formatBuffer);
+      arrowSchema.dictionary = nullptr;
+
       // Dictionary data is flattened. Set the underlying data types.
       if (vec->valueVector() != nullptr &&
           vec->wrappedVector()->encoding() == VectorEncoding::Simple::ARRAY) {
-        auto child = std::make_unique<ArrowSchema>();
-        auto& arrays = *vec->wrappedVector()->asUnchecked<ArrayVector>();
-        auto& nestedType = arrays.type();
-
-        BOLT_CHECK(arrays.elements()->type()->equivalent(
-            *nestedType->asArray().elementType()));
-
-        arrowSchema.format = exportArrowFormatStr(
-            nestedType, options, bridgeHolder->formatBuffer);
-        arrowSchema.dictionary = nullptr;
-
-        exportToArrow(arrays.elements(), *child, options, {}, pool);
-        child->name = "item";
-        bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
+        exportArrayToArrowSchema(
+            *vec->wrappedVector()->asUnchecked<ArrayVector>(),
+            arrowSchema,
+            options,
+            bridgeHolder.get(),
+            pool);
+      } else if (
+          vec->valueVector() != nullptr &&
+          vec->wrappedVector()->encoding() == VectorEncoding::Simple::MAP) {
+        exportMapToArrowSchema(
+            *vec->wrappedVector()->asUnchecked<MapVector>(),
+            arrowSchema,
+            options,
+            bridgeHolder.get(),
+            pool);
+      } else if (
+          vec->valueVector() != nullptr &&
+          vec->wrappedVector()->encoding() == VectorEncoding::Simple::ROW) {
+        exportRowToArrowSchema(
+            *vec->wrappedVector()->asUnchecked<RowVector>(),
+            arrowSchema,
+            options,
+            bridgeHolder.get(),
+            fieldNames,
+            pool);
       } else {
         arrowSchema.n_children = 0;
         arrowSchema.children = nullptr;
-        arrowSchema.dictionary = nullptr;
-        arrowSchema.format =
-            exportArrowFormatStr(type, options, bridgeHolder->formatBuffer);
       }
     } else {
+      if (options.exportToArrowIPC) {
+        VectorPtr payload = vec->valueVector();
+        while (payload &&
+               payload->encoding() == VectorEncoding::Simple::DICTIONARY) {
+          payload = payload->valueVector();
+        }
+
+        arrowSchema.n_children = 0;
+        arrowSchema.children = nullptr;
+        arrowSchema.format = "i";
+
+        auto dict = std::make_unique<ArrowSchema>();
+        exportToArrow(payload, *dict, options);
+        bridgeHolder->dictionary = std::move(dict);
+        arrowSchema.dictionary = bridgeHolder->dictionary.get();
+
+        arrowSchema.release = releaseArrowSchema;
+        arrowSchema.private_data = bridgeHolder.release();
+        return;
+      }
       arrowSchema.n_children = 0;
       arrowSchema.children = nullptr;
 
@@ -1668,89 +2200,27 @@ void exportToArrow(
     arrowSchema.dictionary = nullptr;
 
     if (type->kind() == TypeKind::MAP) {
-      // Need to wrap the key and value types in a struct type.
-      BOLT_DCHECK_EQ(type->size(), 2);
-      auto child = std::make_unique<ArrowSchema>();
-      auto& maps = *vec->asUnchecked<MapVector>();
-      auto rows = std::make_shared<RowVector>(
-          nullptr,
-          ROW({"key", "value"}, {type->childAt(0), type->childAt(1)}),
-          nullptr,
-          0,
-          std::vector<VectorPtr>{maps.mapKeys(), maps.mapValues()},
-          maps.getNullCount());
-      exportToArrow(rows, *child, options, {}, pool);
-      child->name = "entries";
-      // Map data should be a non-nullable struct type.
-      clearNullableFlag(child->flags);
-      // Map data key type should be non-nullable.
-      clearNullableFlag(child->children[0]->flags);
-      bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
-
+      exportMapToArrowSchema(
+          *vec->asUnchecked<MapVector>(),
+          arrowSchema,
+          options,
+          bridgeHolder.get(),
+          pool);
     } else if (type->kind() == TypeKind::ARRAY) {
-      auto child = std::make_unique<ArrowSchema>();
-      auto& arrays = *vec->asUnchecked<ArrayVector>();
-      BOLT_CHECK(
-          arrays.elements()->type()->equivalent(*type->asArray().elementType()),
-          "array vector child type: {}, type child: {}",
-          arrays.elements()->type()->toString(),
-          type->asArray().elementType()->toString());
-      exportToArrow(arrays.elements(), *child, options, {}, pool);
-      // Name is required, and "item" is the default name used in arrow itself.
-      child->name = "item";
-      bridgeHolder->setChildAtIndex(0, std::move(child), arrowSchema);
-
+      exportArrayToArrowSchema(
+          *vec->asUnchecked<ArrayVector>(),
+          arrowSchema,
+          options,
+          bridgeHolder.get(),
+          pool);
     } else if (type->kind() == TypeKind::ROW) {
-      auto& rows = *vec->asUnchecked<RowVector>();
-      auto numChildren = rows.childrenSize();
-      bridgeHolder->childrenRaw.resize(numChildren);
-      bridgeHolder->childrenOwned.resize(numChildren);
-
-      // Hold the shared_ptr so we can set the ArrowSchema.name pointer to its
-      // internal `name` string.
-      bridgeHolder->rowType = std::static_pointer_cast<const RowType>(type);
-
-      arrowSchema.children = bridgeHolder->childrenRaw.data();
-      arrowSchema.n_children = numChildren;
-
-      for (size_t i = 0; i < numChildren; ++i) {
-        // Recurse down the children. We use the same trick of temporarily
-        // holding the buffer in a unique_ptr so it doesn't leak if the
-        // recursion throws.
-        //
-        // But this is more nuanced: for types with a list of children (like
-        // row/structs), if one of the children throws, we need to make sure we
-        // call release() on the children that have already been created before
-        // we re-throw the exception back to the client, or memory will leak.
-        // This is needed because Arrow doesn't define what the client needs to
-        // do if the conversion fails, so we can't expect the client to call the
-        // release() method.
-        try {
-          auto& currentSchema = bridgeHolder->childrenOwned[i];
-          currentSchema = std::make_unique<ArrowSchema>();
-          BOLT_CHECK(
-              rows.childAt(i)->type()->equivalent(*type->asRow().childAt(i)),
-              "row vector child index: {}, type: {}, type child: {}",
-              i,
-              rows.childAt(i)->type()->toString(),
-              type->asRow().childAt(i)->toString());
-          exportToArrow(rows.childAt(i), *currentSchema, options, {}, pool);
-          if (fieldNames.size() == numChildren) {
-            currentSchema->name = fieldNames[i].data();
-          } else {
-            currentSchema->name = bridgeHolder->rowType->nameOf(i).data();
-          }
-          arrowSchema.children[i] = currentSchema.get();
-        } catch (const BoltException&) {
-          // Release any children that have already been built before
-          // re-throwing the exception back to the client.
-          for (size_t j = 0; j < i; ++j) {
-            arrowSchema.children[j]->release(arrowSchema.children[j]);
-          }
-          throw;
-        }
-      }
-
+      exportRowToArrowSchema(
+          *vec->asUnchecked<RowVector>(),
+          arrowSchema,
+          options,
+          bridgeHolder.get(),
+          fieldNames,
+          pool);
     } else {
       BOLT_DCHECK_EQ(type->size(), 0);
       arrowSchema.n_children = 0;
@@ -2181,6 +2651,9 @@ VectorPtr importFromArrowImpl(
 
   // First parse and generate a Bolt type.
   auto type = importFromArrow(arrowSchema);
+  if (options.exportToArrowIPC && type->kind() == TypeKind::UNKNOWN) {
+    return BaseVector::createNullConstant(type, arrowArray.length, pool);
+  }
 
   // Wrap the nulls buffer into a Bolt BufferView (zero-copy). Null buffer size
   // needs to be at least one bit per element.
@@ -2365,7 +2838,7 @@ VectorPtr importFromArrowImpl(
       arrowSchema,
       arrowArray,
       pool,
-      /*isViewer=*/false,
+      false,
       [&schemaReleaser, &arrayReleaser](const void* buffer, size_t length) {
         return wrapInBufferViewAsOwner(
             buffer, length, schemaReleaser, arrayReleaser);

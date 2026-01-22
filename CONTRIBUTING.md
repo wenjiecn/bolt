@@ -40,37 +40,66 @@ If you're a first-time contributor, we recommend starting with issues labeled "g
 
 ## Development Environment Setup
 
-Bolt uses Conan for dependency management and a Makefile to drive its build and test processes. Follow these steps to set up your environment.
+Bolt uses **Conan 2** for dependency management and a Makefile to drive its build and test processes. You can set up the environment automatically using our helper script, or configure it manually if you prefer granular control over your toolchain.
 
 ### Prerequisites
 
-- **OS**: Linux (Ubuntu 20.04+, CentOS 7+). macOS is currently experimental.
+- **OS**: Linux (Ubuntu 20.04+, CentOS 7+) or macOS (Experimental).
 
-- **Compiler**: GCC 10+ or Clang 12+ (C++17 support required).
+- **Compiler**: GCC 10+ or Clang 16+ (Must support C++17).
+- **Build Tools**: CMake 3.25+, Ninja.
+- **Dependency Manager**: Conan 2.0+.
 
-- **Build Tools**: CMake 3.20+, Ninja.
+### Setup Options
 
-- **Dependency Manager**: Conan 2.
+#### Option 1: Automatic Setup (Recommended)
 
-
-### One-Click Script (Recommended)
-
-Run the following script to check your compiler, install Conan, configure its profile, and import dependency recipes into your local cache:
+Run the helper script to bootstrap your development environment:
 
 ```Bash
 scripts/setup-dev-env.sh
 ```
+**⚠️ Important: What this script does** This script is "opinionated" and performs the following actions. Please review them to ensure they fit your workflow:
 
-This script will:
+1. **Python Environment (Miniconda)**:
+   - Checks for `~/miniconda3`.
+   - **If missing**: Automatically downloads and installs Miniconda locally.
+   - **Shell Modification**: Appends the Miniconda path to your shell configuration file (`~/.bashrc` or `~/.zshrc`).
+   - Installs Python dependencies (including `conan`) into this environment.
+2. **Conan Configuration**:
+   - Sets the C++ standard to `gnu17` in the default Conan profile.
+   - **Clones & Patches Recipes**: Calls `install-bolt-deps.sh` to download a specific version of `conan-center-index` to `~/.conan2/conan-center-index` and applies Bolt-specific patches (required for `folly`, `arrow`, etc.).
+   - Configures local Conan remotes to prioritize these patched recipes.
+3. **Git Hooks**: Installs `pre-commit` hooks for automatic code formatting.
 
-- Check for a compatible compiler version (GCC 10/11/12 or Clang 16).
+#### Option 2: Manual Setup (For Advanced Users)
 
-- Install Conan and `pydot`, then create/adjust the default profile (setting the C++ standard to `gnu17` from `gnu14`).
+If you prefer to manage your own Python environment (e.g., via system packages, pyenv, or poetry) or use a specific compiler, you can skip the setup script. However, you **must** still configure the Conan dependencies manually.
 
-- Call `scripts/install-bolt-deps.sh` to export recipes for dependencies like folly, arrow, sonic-cpp, ryu, roaring, utf8proc, date, and llvm-core to your local Conan cache.
+1. **Install Python Dependencies**:
 
+   ```Bash
+   pip install -r requirements.txt
+   pre-commit install
+   ```
 
-**Note**: The first-time build will compile dependencies from source and cache them, which can be time-consuming. You can set up your own Conan remote to speed up builds.
+2. **Configure Conan Dependencies (Crucial)**: Bolt relies on patched versions of several libraries. You must run the dependency installation script to set up the local recipe index and apply necessary patches:
+
+   ```Bash
+   # This sets up the local conan-center-index with required patches
+   # and configures the 'bolt-local' and 'bolt-cci-local' remotes.
+   scripts/install-bolt-deps.sh
+   ```
+
+### Platform Specific Notes
+
+- **First-Time Build**: The first build will compile dependencies from source (e.g., Folly, Arrow), which can take a significant amount of time. Please be patient.
+
+- **macOS Users**: Ensure Xcode Command Line Tools are installed:
+
+  ```bash
+  xcode-select --install
+  ```
 
 ## Fork and PR Workflow
 
@@ -122,6 +151,7 @@ make release_spark
 ```Bash
 make release_spark BUILD_VERSION=main
 ```
+
 
 ### Working with IDE
 

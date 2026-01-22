@@ -103,9 +103,12 @@ header:
     - '**/.gitignore'
     - '**/*.json'
     - '**/*.md'
+    - "**/go.mod"
+    - "**/go.sum"
     - '**/*.patch'
     - '**/*.txt'
     - '.git/**'
+    - '.github/**'
     - '.licenserc.yaml'
     - 'license.header'
     - 'bolt/tpch/gen/dbgen/**'

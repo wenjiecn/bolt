@@ -90,7 +90,6 @@ _build/
 a.out
 CMake/resolve_dependency_module/boost/FindBoost.cmake
 __cmake_systeminformation/
-bolt/version/version.h
 
 #==============================================================================#
 # Kate Swap Files
@@ -333,7 +332,8 @@ conan.options
 .ccls
 .ccls-cache/*
 
-
 # makefile clang-format files
 files.txt
 log.txt
+
+bolt/version/version.h

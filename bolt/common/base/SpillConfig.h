@@ -34,7 +34,9 @@
 #include <string.h>
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <optional>
 #include "bolt/common/compression/Compression.h"
+#include "bolt/vector/VectorStream.h"
 namespace bytedance::bolt::common {
 
 #define BOLT_SPILL_LIMIT_EXCEEDED(errorMessage)                     \
@@ -68,8 +70,6 @@ enum class RowBasedSpillMode {
   COMPRESSION // row based spill with compression
 };
 
-auto format_as(RowBasedSpillMode m);
-
 RowBasedSpillMode strToRowBasedSpillMode(const std::string& str);
 
 /// Specifies the config for spilling.
@@ -94,6 +94,7 @@ struct SpillConfig {
       const std::string& _compressionKind,
       const std::string& _fileCreateConfig = {},
       const std::string& _rowBasedSpillMode = "disabled",
+      const std::string& _singlePartitionSerdeKind = {},
       bool _jitEnabled = true);
 
   /// Returns the hash join spilling level with given 'startBitOffset'.
@@ -127,6 +128,35 @@ struct SpillConfig {
 
   SpillConfig& setJITenableForSpill(bool enabled) noexcept;
   bool getJITenabledForSpill() const noexcept;
+
+  struct SpillIOConfig {
+    GetSpillDirectoryPathCB getSpillDirPathCb;
+    UpdateAndCheckSpillLimitCB updateAndCheckSpillLimitCb;
+    std::string fileNamePrefix;
+    uint64_t maxFileSize;
+    bool spillUringEnabled;
+    uint64_t writeBufferSize;
+    common::CompressionKind compressionKind;
+    std::string fileCreateConfig;
+    std::optional<VectorSerde::Kind> spillSerdeKind;
+  };
+
+  SpillIOConfig spillIOConfig(int32_t maxPartitions) const {
+    std::optional<VectorSerde::Kind> kind;
+    if (maxPartitions == 1 && !singlePartitionSerdeKind.empty()) {
+      kind = VectorSerde::kindByName(singlePartitionSerdeKind);
+    }
+    return SpillIOConfig{
+        getSpillDirPathCb,
+        updateAndCheckSpillLimitCb,
+        fileNamePrefix,
+        maxFileSize,
+        spillUringEnabled,
+        writeBufferSize,
+        compressionKind,
+        fileCreateConfig,
+        kind};
+  }
 
   /// The max spill file size. If it is zero, there is no limit on the spill
   /// file size.
@@ -189,6 +219,9 @@ struct SpillConfig {
   // spill direct with row format
   RowBasedSpillMode rowBasedSpillMode;
 
+  // Optional serde kind for single-partition row-vector spill (e.g., "Arrow").
+  std::string singlePartitionSerdeKind;
+
   /// The max allowed number of partitions to be adjusted upwards.
   uint32_t spillPartitionsAdaptiveThreshold{128};
 
@@ -202,3 +235,21 @@ struct SpillConfig {
   size_t aggBypassHTEqualNum{0};
 };
 } // namespace bytedance::bolt::common
+
+template <>
+struct fmt::formatter<bytedance::bolt::common::RowBasedSpillMode>
+    : fmt::formatter<std::string_view> {
+  auto format(bytedance::bolt::common::RowBasedSpillMode c, format_context& ctx)
+      const {
+    switch (c) {
+      case bytedance::bolt::common::RowBasedSpillMode::DISABLE:
+        return fmt::formatter<std::string_view>::format("DISABLE", ctx);
+      case bytedance::bolt::common::RowBasedSpillMode::RAW:
+        return fmt::formatter<std::string_view>::format("RAW", ctx);
+      case bytedance::bolt::common::RowBasedSpillMode::COMPRESSION:
+        return fmt::formatter<std::string_view>::format("COMPRESSION", ctx);
+      default:
+        return fmt::format_to(ctx.out(), "unknown[{}]", static_cast<int>(c));
+    }
+  }
+};

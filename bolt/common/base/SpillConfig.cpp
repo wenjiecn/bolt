@@ -29,8 +29,12 @@
  */
 
 #include "bolt/common/base/SpillConfig.h"
+
+#include <fmt/format.h>
+
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/base/SuccinctPrinter.h"
+
 namespace bytedance::bolt::common {
 
 RowBasedSpillMode strToRowBasedSpillMode(const std::string& str) {
@@ -62,6 +66,7 @@ SpillConfig::SpillConfig(
     const std::string& _compressionKind,
     const std::string& _fileCreateConfig,
     const std::string& _rowBasedSpillMode,
+    const std::string& _singlePartitionSerdeKind,
     bool jitEnabled)
     : getSpillDirPathCb(std::move(_getSpillDirPathCb)),
       updateAndCheckSpillLimitCb(std::move(_updateAndCheckSpillLimitCb)),
@@ -84,6 +89,7 @@ SpillConfig::SpillConfig(
       compressionKind(common::stringToCompressionKind(_compressionKind)),
       fileCreateConfig(_fileCreateConfig),
       rowBasedSpillMode(strToRowBasedSpillMode(_rowBasedSpillMode)),
+      singlePartitionSerdeKind(_singlePartitionSerdeKind),
       jitEnabled(jitEnabled) {
   BOLT_USER_CHECK_GE(
       spillableReservationGrowthPct,
@@ -126,14 +132,14 @@ int32_t SpillConfig::joinSpillLevel(
     return 0;
   }
   auto mapToString = [&]() -> std::string {
-    std::string mapstr = "{";
-    for (auto it = offsetToJoinBits.begin(); it != offsetToJoinBits.end();
-         ++it) {
-      mapstr += "[" + std::to_string(it->first) + ":" +
-          std::to_string(it->second) + "],";
+    std::vector<std::string> pairs;
+    pairs.reserve(offsetToJoinBits.size());
+
+    for (const auto& [offset, bits] : offsetToJoinBits) {
+      pairs.emplace_back(fmt::format("[{}:{}]", offset, bits));
     }
-    mapstr += "}";
-    return mapstr;
+
+    return fmt::format("{{{}}}", fmt::join(pairs, ","));
   };
   // should start from startPartitionBit
   auto firstIt = offsetToJoinBits.begin();
@@ -199,6 +205,7 @@ std::string SpillConfig::toString() const {
       "compressionKind:{},\n\t"
       "fileCreateConfig:{}\n"
       "rowBasedSpillMode:{}\n"
+      "singlePartitionSerdeKind:{}\n"
       "jitEnabled:{}\n",
       fileNamePrefix,
       succinctBytes(maxFileSize),
@@ -214,6 +221,7 @@ std::string SpillConfig::toString() const {
       compressionKind,
       fileCreateConfig,
       rowBasedSpillMode,
+      singlePartitionSerdeKind,
       jitEnabled);
 }
 
@@ -225,9 +233,4 @@ SpillConfig& SpillConfig::setJITenableForSpill(bool enabled) noexcept {
 bool SpillConfig::getJITenabledForSpill() const noexcept {
   return jitEnabled;
 }
-
-auto format_as(RowBasedSpillMode m) {
-  return fmt::underlying(m);
-}
-
 } // namespace bytedance::bolt::common

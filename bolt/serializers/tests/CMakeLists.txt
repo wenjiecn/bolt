@@ -26,33 +26,66 @@
 # --------------------------------------------------------------------------
 
 add_executable(
-  bolt_serializer_test CompactRowSerializerTest.cpp PrestoOutputStreamListenerTest.cpp
-                       PrestoSerializerTest.cpp UnsafeRowSerializerTest.cpp
+    bolt_serializer_test
+    PrestoOutputStreamListenerTest.cpp
+    PrestoSerializerTest.cpp
+    UnsafeRowSerializerTest.cpp
+    CompactRowSerializerTest.cpp
+    ArrowSerializerTest.cpp
 )
 
 add_test(bolt_serializer_test bolt_serializer_test)
 
 target_link_libraries(
-  bolt_serializer_test
-  bolt_presto_serializer
-  bolt_vector_test_lib
-  bolt_vector_fuzzer
-  bolt_row_fast
-  GTest::gtest
-  GTest::gtest_main
-  gflags::gflags
-  glog::glog
+    bolt_serializer_test
+    bolt_presto_serializer
+    bolt_vector_test_lib
+    bolt_vector_fuzzer
+    bolt_row_fast
+    GTest::gtest
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
 )
 
 add_executable(bolt_serializer_benchmark SerializerBenchmark.cpp)
 
 target_link_libraries(
-  bolt_serializer_benchmark
-  bolt_presto_serializer
-  bolt_vector_test_lib
-  bolt_vector_fuzzer
-  GTest::gtest
-  GTest::gtest_main
-  gflags::gflags
-  glog::glog
+    bolt_serializer_benchmark
+    bolt_presto_serializer
+    bolt_vector_test_lib
+    bolt_vector_fuzzer
+    GTest::gtest
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
+)
+
+add_executable(bolt_arrowserde_test ArrowSerializerTest.cpp)
+
+add_test(bolt_arrowserde_test bolt_arrowserde_test)
+
+target_link_libraries(
+    bolt_arrowserde_test
+    bolt_presto_serializer
+    bolt_vector_test_lib
+    bolt_vector_fuzzer
+    bolt_row_fast
+    GTest::gtest
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
+)
+
+add_executable(bolt_arrowserde_benchmark ArrowSerializerBenchmark.cpp)
+
+target_link_libraries(
+    bolt_arrowserde_benchmark
+    bolt_presto_serializer
+    bolt_vector_test_lib
+    bolt_vector_fuzzer
+    GTest::gtest
+    GTest::gtest_main
+    gflags::gflags
+    glog::glog
 )

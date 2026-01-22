@@ -26,11 +26,20 @@
 # --------------------------------------------------------------------------
 
 add_library(
-  bolt_presto_serializer CompactRowSerializer.cpp PrestoSerializer.cpp UnsafeRowSerializer.cpp
+    bolt_presto_serializer
+    PrestoSerializer.cpp
+    UnsafeRowSerializer.cpp
+    CompactRowSerializer.cpp
+    ArrowSerializer.cpp
 )
 
-target_link_libraries(bolt_presto_serializer bolt_vector bolt_row_fast utf8proc::utf8proc)
+target_link_libraries(
+    bolt_presto_serializer
+    bolt_vector
+    bolt_row_fast
+    utf8proc::utf8proc
+)
 
 if(${BOLT_BUILD_TESTING})
-  add_subdirectory(tests)
+    add_subdirectory(tests)
 endif()

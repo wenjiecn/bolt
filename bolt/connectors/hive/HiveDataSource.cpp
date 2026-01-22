@@ -38,6 +38,7 @@
 
 #include "bolt/connectors/hive/HiveConfig.h"
 #include "bolt/connectors/hive/HiveConnectorUtil.h"
+#include "bolt/connectors/hive/IgnoreCorruptFile.h"
 #include "bolt/connectors/hive/PaimonMiscHelpers.h"
 #include "bolt/connectors/hive/PaimonSplitReader.h"
 #include "bolt/connectors/hive/SplitReader.h"
@@ -48,56 +49,6 @@ namespace bytedance::bolt::connector::hive {
 
 class HiveTableHandle;
 class HiveColumnHandle;
-
-namespace {
-
-int64_t extractAttemptNumber(const std::string& taskId) {
-  const std::string prefix = "ATTEMPT_";
-  size_t prefixPos = taskId.find(prefix);
-
-  if (prefixPos == std::string::npos) {
-    return -1;
-  }
-
-  size_t numStart = prefixPos + prefix.length();
-  size_t numEnd = numStart;
-
-  while (numEnd < taskId.length() && std::isdigit(taskId[numEnd])) {
-    numEnd++;
-  }
-
-  if (numEnd == numStart) {
-    return -1;
-  }
-
-  try {
-    return std::stoi(taskId.substr(numStart, numEnd - numStart));
-  } catch (...) {
-    return -1;
-  }
-  return -1;
-}
-
-#ifdef BOLT_ENABLE_HDFS
-void enrichExceptionSetFromConf(
-    std::string exceptionStr,
-    std::vector<std::string>& exceptionKeyWords) {
-  // only init exceptionSet exactly once
-  if (exceptionStr.empty() || !exceptionKeyWords.empty()) {
-    return;
-  }
-
-  const char delimeter = exceptionStr.back();
-  exceptionStr.pop_back();
-  folly::split(delimeter, exceptionStr, exceptionKeyWords);
-
-  LOG(INFO) << "Split exception str by " << static_cast<char>(delimeter)
-            << ", and split result is: "
-            << fmt::format("{}", fmt::join(exceptionKeyWords, ", "));
-}
-#endif
-
-} // namespace
 
 HiveDataSource::HiveDataSource(
     const RowTypePtr& outputType,
@@ -126,19 +77,10 @@ HiveDataSource::HiveDataSource(
   }
   fsSessionConfig_.bufferSize = static_cast<size_t>(hiveConfig_->loadQuantum());
   native_cache_enabled = queryConfig.isNativeCacheEnabled();
-  ignoreCorruptFiles_ = queryConfig.ignoreCorruptFiles();
-#ifdef BOLT_ENABLE_HDFS
-  taskMaxFailures_ = queryConfig.taskMaxFailures();
-  if (ignoreCorruptFiles_) {
-    // Only here the variable canIgnoredExceptions_ needs to be written, so it
-    // needs to be locked. In other places, only the find() method is used. The
-    // find() method is thread-safe in C++11 and later standards.
-    std::unique_lock<std::mutex> guard(canIgnoredExceptionsMutex_);
-    enrichExceptionSetFromConf(
-        queryConfig.canBeTreatedAsCorruptedFileExceptions(),
-        canIgnoredExceptions_);
-  }
-#endif
+  IgnoreCorruptFileHelper::globalInitialize(
+      queryConfig.taskMaxFailures(),
+      queryConfig.ignoreCorruptFiles(),
+      queryConfig.canBeTreatedAsCorruptedFileExceptions());
 
   enable_parquet_rownum_and_filename =
       queryConfig.isDataRetentionUpdateEnabled() &&
@@ -239,6 +181,23 @@ HiveDataSource::HiveDataSource(
   }
 
   readerOutputType_ = ROW(std::move(readerRowNames), std::move(readerRowTypes));
+  const auto& names = readerOutputType_->names();
+  const auto readColumnsAsLowercase =
+      hiveConfig_->isFileColumnNamesReadAsLowerCase(
+          connectorQueryCtx_->sessionProperties());
+  // Each element is a pair of column index and column name
+  std::vector<std::tuple<size_t, std::optional<std::string>>> rowIndexColumns;
+  for (int i = 0; i < names.size(); ++i) {
+    const auto& name = names[i];
+    if (paimon::kColumnNameRowIndex == name) {
+      rowIndexColumns.emplace_back(i, std::nullopt);
+    } else if (
+        (!readColumnsAsLowercase && paimon::kColumnNameRowID == name) ||
+        (readColumnsAsLowercase &&
+         boost::algorithm::iequals(paimon::kColumnNameRowID, name))) {
+      rowIndexColumns.emplace_back(i, paimon::kColumnNameRowID);
+    }
+  }
   scanSpec_ = makeScanSpec(
       readerOutputType_,
       subfields,
@@ -248,7 +207,8 @@ HiveDataSource::HiveDataSource(
       infoColumns_,
       pool_,
       expressionEvaluator_,
-      runtimeStats_.get());
+      runtimeStats_.get(),
+      rowIndexColumns);
   if (remainingFilter) {
     bool enableMapSubscriptFilter =
         queryConfig.mapSubscriptFilterPushdownEnabled();
@@ -407,82 +367,19 @@ std::unique_ptr<SplitReader> HiveDataSource::createConfiguredSplitReader(
   splitReader->rowReaderOptions().setParquetRepDefMemoryLimit(
       parquetRepDefMemoryLimit_);
 
-#ifdef BOLT_ENABLE_HDFS
-  // TODO (Ebe): Deal with the corrupteds
-  if (UNLIKELY(ignoreCorruptFiles_)) {
-    // ignore metadata read error
-    try {
+  TRY_WITH_IGNORE(
+      connectorQueryCtx_->taskId(),
       splitReader->prepareSplit(
           metadataFilter_,
           *runtimeStats_,
           fsSessionConfig_,
           finalCacheEnabled,
           columnCacheBlackList,
-          hiveConnectorSplitCacheLimit.get());
-    } catch (const ::bytedance::bolt::filesystems::StorageException& e) {
-      bool canbeIgnored = isLastRetry() &&
-          kMustIgnoredExceptions.find(e.getStorageErrorType()) !=
-              kMustIgnoredExceptions.end();
-
-      LOG(ERROR) << "Catch StorageException, exception_type="
-                 << e.getStorageErrorType() << ", "
-                 << (canbeIgnored ? "Can" : "Can't")
-                 << " be ignored, exception_msg=" << e.getStorageErrorMessage();
-
-      if (canbeIgnored) {
+          hiveConnectorSplitCacheLimit.get()),
+      {
         ignoredFileSizes_ += split->length;
         resetSplit();
-      } else {
-        std::rethrow_exception(std::current_exception());
-      }
-    } catch (const dwio::common::exception::DecompressionLoggedException& e) {
-      bool canbeIgnored = isLastRetry();
-      LOG(ERROR) << "Catch DecompressionLoggedException. "
-                 << (canbeIgnored ? "Can" : "Can't")
-                 << " be ignored, exception_msg=" << e.what();
-      if (canbeIgnored) {
-        ignoredFileSizes_ += split->length;
-        resetSplit();
-      } else {
-        std::rethrow_exception(std::current_exception());
-      }
-    } catch (const std::exception& e) {
-      if (!isLastRetry()) {
-        LOG(ERROR)
-            << "Catch exception which can't be ignored, exception detail is: "
-            << e.what();
-        std::rethrow_exception(std::current_exception());
-      }
-      bool hasBeenProcessed = false;
-      std::string exceptionMsg = e.what();
-      for (const std::string& expectExceptionMsg : canIgnoredExceptions_) {
-        if (exceptionMsg.find(expectExceptionMsg) != std::string::npos) {
-          LOG(ERROR)
-              << exceptionMsg
-              << " can be ignored during preparing split because of contains: "
-              << expectExceptionMsg;
-          ignoredFileSizes_ += split->length;
-          resetSplit();
-          hasBeenProcessed = true;
-          break;
-        }
-      }
-      if (!hasBeenProcessed) {
-        std::rethrow_exception(std::current_exception());
-      }
-    }
-  } else {
-#endif
-    splitReader->prepareSplit(
-        metadataFilter_,
-        *runtimeStats_,
-        fsSessionConfig_,
-        finalCacheEnabled,
-        columnCacheBlackList,
-        hiveConnectorSplitCacheLimit.get());
-#ifdef BOLT_ENABLE_HDFS
-  }
-#endif
+      });
 
   return splitReader;
 }
@@ -562,7 +459,7 @@ std::vector<std::string> HiveDataSource::getPaimonSequenceFields(
   }
 
   auto result = splitByComma(sequenceFields);
-  std::string sequenceField = connector::paimon::kSEQUENCE_NUMBER;
+  std::string sequenceField = paimon::kSEQUENCE_NUMBER;
   if (hiveConfig_->isFileColumnNamesReadAsLowerCase(
           connectorQueryCtx_->sessionProperties())) {
     folly::toLowerAscii(sequenceField);
@@ -617,9 +514,19 @@ void HiveDataSource::addSplit(
     splitReader_.reset();
   }
 
+  const auto& tableParameters = hiveTableHandle_->tableParameters();
+  // append-only tables don't need to read additional fields
+  if (tableParameters.find(paimon::kPrimaryKey) == tableParameters.end()) {
+    BOLT_USER_CHECK(
+        split->hiveSplits.size() == 1,
+        "Append-only tables should only have a single split");
+    splitReader_ = createConfiguredSplitReader(split->hiveSplits[0], false);
+    return;
+  }
+
   auto fileType = getRowTypeForFile(split);
-  auto& fileColNames = fileType->names();
-  auto& fileColTypes = fileType->children();
+  const auto& fileColNames = fileType->names();
+  const auto& fileColTypes = fileType->children();
 
   auto names = readerOutputType_->names();
   auto types = readerOutputType_->children();
@@ -627,7 +534,6 @@ void HiveDataSource::addSplit(
   std::vector<int> valueIndices(names.size());
   std::iota(valueIndices.begin(), valueIndices.end(), 0);
 
-  const auto& tableParameters = hiveTableHandle_->tableParameters();
   auto primaryKeyNames = getPaimonPrimaryKeys(tableParameters);
   auto primaryKeyIndices = addColumnsIfNotExists(
       names, types, fileColNames, fileColTypes, primaryKeyNames);
@@ -660,7 +566,8 @@ void HiveDataSource::addSplit(
       std::move(sequenceNumberIndices),
       rowkindFieldIndex,
       std::move(valueIndices),
-      tableParameters);
+      tableParameters,
+      ioStats_);
 
   readerOutputType_ = oldReaderOutputType;
 }
@@ -704,7 +611,8 @@ std::optional<RowVectorPtr> HiveDataSource::next(
     uint64_t size,
     bolt::ContinueFuture& /*future*/) {
   // first check whether the prepared split is corrupted and should be ignored.
-  if (ignoreCorruptFiles_ && split_ == nullptr) {
+  if (IgnoreCorruptFileHelper::isIgnoreCorruptFilesEnabled() &&
+      split_ == nullptr) {
     LOG(WARNING) << "ignore corrupt split";
     return nullptr;
   }
@@ -726,66 +634,14 @@ std::optional<RowVectorPtr> HiveDataSource::next(
   // any column, e.g. rand() < 0.1. Evaluate that conjunct first, then scan
   // only rows that passed.
   uint64_t rowsScanned = 0;
-#ifdef BOLT_ENABLE_HDFS
-  if (UNLIKELY(ignoreCorruptFiles_)) {
-    try {
-      rowsScanned = splitReader_->next(size, output_);
-    } catch (const ::bytedance::bolt::filesystems::StorageException& e) {
-      bool canbeIgnored = isLastRetry() &&
-          kMustIgnoredExceptions.find(e.getStorageErrorType()) !=
-              kMustIgnoredExceptions.end();
-
-      LOG(ERROR) << "Catch StorageException, exception_type="
-                 << e.getStorageErrorType() << ", "
-                 << (canbeIgnored ? "Can" : "Can't")
-                 << " be ignored, exception_msg=" << e.getStorageErrorMessage();
-
-      if (canbeIgnored) {
+  TRY_WITH_IGNORE(
+      connectorQueryCtx_->taskId(),
+      rowsScanned = splitReader_->next(size, output_),
+      {
         ignoredFileSizes_ += getLength(split_);
         resetSplit();
         return nullptr;
-      } else {
-        std::rethrow_exception(std::current_exception());
-      }
-    } catch (const dwio::common::exception::DecompressionLoggedException& e) {
-      bool canbeIgnored = isLastRetry();
-      LOG(ERROR) << "Catch DecompressionLoggedException. "
-                 << (canbeIgnored ? "Can" : "Can't")
-                 << " be ignored, exception_msg=" << e.what();
-      if (canbeIgnored) {
-        ignoredFileSizes_ += getLength(split_);
-        resetSplit();
-        return nullptr;
-      } else {
-        std::rethrow_exception(std::current_exception());
-      }
-    } catch (const std::exception& e) {
-      if (!isLastRetry()) {
-        LOG(ERROR)
-            << "Catch exception which can't be ignored, exception detail is: "
-            << e.what();
-        std::rethrow_exception(std::current_exception());
-      }
-      std::string exceptionMsg = e.what();
-      for (const std::string& expectExceptionMsg : canIgnoredExceptions_) {
-        if (exceptionMsg.find(expectExceptionMsg) != std::string::npos) {
-          LOG(ERROR)
-              << exceptionMsg
-              << " can be ignored during preparing split because of contains: "
-              << expectExceptionMsg;
-          ignoredFileSizes_ += getLength(split_);
-          resetSplit();
-          return nullptr;
-        }
-      }
-      std::rethrow_exception(std::current_exception());
-    }
-  } else {
-#endif
-    rowsScanned = splitReader_->next(size, output_);
-#ifdef BOLT_ENABLE_HDFS
-  }
-#endif
+      });
 
   completedRows_ += rowsScanned;
 
@@ -877,6 +733,9 @@ std::unordered_map<std::string, RuntimeCounter> HiveDataSource::runtimeStats() {
        RuntimeCounter(ioStats_->ramHit().sum(), RuntimeCounter::Unit::kBytes)},
       {"totalScanTime",
        RuntimeCounter(ioStats_->totalScanTime(), RuntimeCounter::Unit::kNanos)},
+      {"totalMergeTime",
+       RuntimeCounter(
+           ioStats_->totalMergeTime(), RuntimeCounter::Unit::kNanos)},
       {"loadMetaDataTime",
        RuntimeCounter(
            ioStats_->loadFileMetaDataTimeNs(), RuntimeCounter::Unit::kNanos)},
@@ -1002,20 +861,6 @@ void HiveDataSource::resetSplit() {
   }
   split_.reset();
 }
-
-#ifdef BOLT_ENABLE_HDFS
-bool HiveDataSource::isLastRetry() {
-  // ignoreCorruptFiles_ only set in gluten/spark env, so it's safe to
-  // extract attempt number from task id
-  const std::string& taskId = connectorQueryCtx_->taskId();
-  const auto attemptNumber = extractAttemptNumber(taskId);
-  BOLT_CHECK(
-      attemptNumber != -1,
-      "Failed to extract attempt number from task ID: {}",
-      taskId);
-  return attemptNumber >= taskMaxFailures_ - 1;
-}
-#endif
 
 void HiveDataSource::recalculateRepDefConf(
     const RowTypePtr& rowType,
