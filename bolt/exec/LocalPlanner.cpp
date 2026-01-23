@@ -1089,8 +1089,9 @@ bool DriverFactory::isRollupEnabled(
   auto numColumns = expandNode->names().size();
   bool rollupEnabled = true;
   for (auto step = 0; step < projections.size(); step++) {
-    if (auto constTypedExpr = 
-        std::dynamic_pointer_cast<const core::ConstantTypedExpr>(projections[step][numColumns - 1])) {
+    if (auto constTypedExpr =
+            std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
+                projections[step][numColumns - 1])) {
       if (constTypedExpr->value().value<int64_t>() != ((1LL << step) - 1)) {
         rollupEnabled = false;
         break;
