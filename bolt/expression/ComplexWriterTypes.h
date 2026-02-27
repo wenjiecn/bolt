@@ -203,7 +203,7 @@ class ArrayWriter {
   }
 
   // Should be called by the user (VectorWriter) when null is committed to
-  // pretect against user miss-use (writing to the writer then committing null).
+  // protect against user miss-use (writing to the writer then committing null).
   void resetLength() {
     // No need to commit last written items and innerOffset_ stays the same for
     // the next item.
@@ -288,7 +288,7 @@ class ArrayWriter {
     } else if constexpr (std::is_same_v<V, bool>) {
       addItemsBoolFastPath(arrayView);
     } else if constexpr (provide_std_interface<V>) {
-      addItemsOrimitiveFastPath<V>(arrayView);
+      addItemsPrimitiveFastPath<V>(arrayView);
     } else {
       addItemsGeneralSlowPath(arrayView);
     }
@@ -328,14 +328,14 @@ class ArrayWriter {
         kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
       addItemsStringFastPath<kind>(data);
     } else if constexpr (TypeTraits<kind>::isPrimitiveType) {
-      addItemsOrimitiveFastPath<typename KindToSimpleType<kind>::type>(data);
+      addItemsPrimitiveFastPath<typename KindToSimpleType<kind>::type>(data);
     } else {
       BOLT_UNREACHABLE("non primitives handled in addItemsGeneric");
     }
   }
 
   template <typename ElementSimpleType, typename Input>
-  void addItemsOrimitiveFastPath(const Input& sourceArray) {
+  void addItemsPrimitiveFastPath(const Input& sourceArray) {
     BOLT_DCHECK_NE(sourceArray.elementKind(), TypeKind::BOOLEAN);
     BOLT_DCHECK_NE(sourceArray.elementKind(), TypeKind::VARBINARY);
     BOLT_DCHECK_NE(sourceArray.elementKind(), TypeKind::VARCHAR);
@@ -633,7 +633,7 @@ class MapWriter {
     return length_;
   }
 
-  // Any map type iteratable in tuple like manner.
+  // Any map type iterable in tuple like manner.
   template <typename MapType>
   void copy_from(const MapType& data) {
     resize(0);
@@ -747,7 +747,7 @@ class MapWriter {
   }
 
   // Should be called by the user (VectorWriter) when null is committed to
-  // pretect against user miss-use (writing to the writer then committing
+  // protect against user miss-use (writing to the writer then committing
   // null).
   void resetLength() {
     // No need to commit last written items and innerOffset_ stays the same
